@@ -19,9 +19,9 @@
 // Node built it. If you hit NODE_MODULE_VERSION errors, rerun with the Node
 // version the checkout was built with (e.g. system node 26 for local builds).
 import { statSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { tmpdir } from 'node:os'
 
@@ -93,12 +93,26 @@ try {
   // reader then classifies the frame as malformed and list()/stat() silently skip it.
   // **version 必须等于后端的当前格式版本**（0.1.2/0.1.3 = v2，0.1.5+ = v3），
   // 否则 encodeCurrentHeader 直接抛 `encodeCurrent requires Session format vN`。
-  const formatUrl = pathToFileURL(join(
-    dirname(requireFrom(pkgs.persistenceJsonl).resolve('@deepseek-ai/dsh-session-format/package.json')),
-    'lib/index.js',
-  )).href
-  const formatMod = await import(formatUrl)
-  const CURRENT_FORMAT_VERSION = formatMod.sessionFormatCatalog?.currentVersion ?? 3
+  // 当前格式版本的探测。0.1.7 起官方把 catalog 拆到了独立包
+  // @deepseek-ai/dsh-session-format-catalog（sessionFormatCatalog.currentVersion）；
+  // 0.1.5 及更早则并在 @deepseek-ai/dsh-session-format 内。两个布局都试，
+  // 都失败才回落到 3（0.1.5 的当前版本）。
+  let CURRENT_FORMAT_VERSION = 3
+  try {
+    const catalogUrl = pathToFileURL(join(
+      dirname(requireFrom(pkgs.persistenceJsonl).resolve('@deepseek-ai/dsh-session-format-catalog/package.json')),
+      'lib/index.js',
+    )).href
+    CURRENT_FORMAT_VERSION = (await import(catalogUrl)).sessionFormatCatalog.currentVersion
+  } catch (e) {
+    try {
+      const formatUrl = pathToFileURL(join(
+        dirname(requireFrom(pkgs.persistenceJsonl).resolve('@deepseek-ai/dsh-session-format/package.json')),
+        'lib/index.js',
+      )).href
+      CURRENT_FORMAT_VERSION = (await import(formatUrl)).sessionFormatCatalog?.currentVersion ?? 3
+    } catch (_) { /* 保留回落值 3 */ }
+  }
   // handle.read() 的返回值形态随版本变化：0.1.3 是事件数组，0.1.5 是
   // `{ eventState, events }`。这个 helper 同时充当形态回归断言——形态不认识就返回
   // null，下面的 check 会立刻失败（2026-09-10 的读取恒空事故就属于这一类）。
@@ -374,6 +388,68 @@ try {
     })())
 
     await rm(process.env.DSH_SESSIONS_MANAGER_TRASH_DIR, { recursive: true, force: true }).catch(() => {})
+  }
+
+  // ---- LEGACY-generation migration smoke (optional --legacy-log <path>) ----
+  // 指向一个真实旧代会话日志（如 ~/.dsh/sessions/<project>/<id>/session.v3.jsonl.zstd），
+  // **拷贝**进临时 root（原件绝不触碰），验证三件事：
+  //   1) 旧代日志在当前后端上可被 list/stat/读取（官方 restore 迁移机制）；
+  //   2) moveSessionToCwd 能把它搬到新工作区（create 路径的 header 版本兼容）；
+  //   3) 移动后落盘的当前代 === 后端当前格式版本（真迁移，不是仅改名）。
+  // 0.1.7（v4）与 0.1.5（v3）之间的格式跳变靠这段钉死；不带参数则整段跳过。
+  const legacyIdx = process.argv.indexOf('--legacy-log')
+  if (legacyIdx >= 0 && process.argv[legacyIdx + 1]) {
+    const legacyLogPath = resolve(process.argv[legacyIdx + 1])
+    const { zstdDecompressSync } = await import('node:zlib')
+    const { scanZstdFrames } = await import('../src/zstd-frame.js')
+    const { projectKeyFor, encodeSegmentFor } = await import('../src/handle-era-paths.js')
+    const raw = await readFile(legacyLogPath)
+    let legacyHeader = null
+    if (/\.zstd?$/.test(legacyLogPath)) {
+      const { frames } = scanZstdFrames(raw)
+      if (frames.length === 0) throw new Error(`legacy fixture: no zstd frames in ${legacyLogPath}`)
+      const frame0 = zstdDecompressSync(raw.subarray(frames[0].start, frames[0].end))
+      for (const line of frame0.toString('utf8').split('\n')) {
+        try { const p = JSON.parse(line); if (p && p.id != null) { legacyHeader = p; break } } catch (_) {}
+      }
+    } else {
+      for (const line of raw.toString('utf8').split('\n')) {
+        try { const p = JSON.parse(line); if (p && p.id != null) { legacyHeader = p; break } } catch (_) {}
+      }
+    }
+    if (!legacyHeader) throw new Error(`legacy fixture: cannot parse header from ${legacyLogPath}`)
+    check('legacy fixture header parsed', typeof legacyHeader.id === 'string' && legacyHeader.version !== undefined, { id: legacyHeader.id, version: legacyHeader.version })
+
+    const legacyRoot = await mkdtemp(join(tmpdir(), 'dsm-runtime-legacy-'))
+    const legacyDir = join(legacyRoot, projectKeyFor(legacyHeader.cwd), encodeSegmentFor(String(legacyHeader.id)))
+    await mkdir(legacyDir, { recursive: true })
+    await copyFile(legacyLogPath, join(legacyDir, basename(legacyLogPath)))
+    // 独立 cordis Context：sessionPersistence 是按 ctx 注册的服务，不能与主实例共用。
+    const legacyCtx = typeof cordis === 'function' ? new cordis() : new cordis.Context()
+    const spLegacy = new JsonlSessionPersistence(legacyCtx, { root: legacyRoot })
+    const legacyAdapter = plugin.createPersistenceAdapter(spLegacy)
+    const legacyId = String(legacyHeader.id)
+
+    const legacyEntry = (await legacyAdapter.listEntries()).find((e) => e.id === legacyId)
+    check('legacy: old-generation log is listed by the current backend', !!legacyEntry)
+    const legacyStat = await spLegacy.stat(legacyId)
+    check('legacy: stat sees the old-generation session', !!legacyStat && legacyStat.header && legacyStat.header.id === legacyId)
+    const legacyRead = await legacyAdapter.readSession(legacyId, 0)
+    check('legacy: old-generation events read through official migration',
+      Array.isArray(legacyRead.events) && legacyRead.events.length === (legacyStat && Number.isSafeInteger(legacyStat.eventCount) ? legacyStat.eventCount : legacyRead.events.length),
+      { events: legacyRead.events.length, statEventCount: legacyStat && legacyStat.eventCount })
+
+    const legacyTarget = join(legacyRoot, 'legacy-moved-target')
+    await opsMod.moveSessionToCwd({ sp: spLegacy, sid: legacyId, header: legacyStat.header, canonical: legacyTarget, events: legacyRead.events, inheritedEventCount: legacyRead.inheritedEventCount })
+    const movedLegacyStat = await spLegacy.stat(legacyId)
+    check('legacy move: official stat carries the new cwd', !!movedLegacyStat && movedLegacyStat.header.cwd === legacyTarget, movedLegacyStat && movedLegacyStat.header.cwd)
+    const movedLegacyEvents = await legacyAdapter.readSession(legacyId, 0)
+    check('legacy move: events preserved byte-identically', JSON.stringify(movedLegacyEvents.events) === JSON.stringify(legacyRead.events), movedLegacyEvents.events.length)
+    const movedArtifacts = await pathsMod.locateSessionArtifacts(spLegacy, movedLegacyStat.header)
+    check('legacy move: latest on-disk generation equals the backend current format version',
+      !!movedArtifacts && pathsMod.generationVersionOf(movedArtifacts.generationFiles[0]) === CURRENT_FORMAT_VERSION,
+      { log: movedArtifacts && movedArtifacts.generationFiles[0], currentVersion: CURRENT_FORMAT_VERSION })
+    await rm(legacyRoot, { recursive: true, force: true }).catch(() => {})
   }
 
   console.log('\ncompat-runtime smoke PASSED')

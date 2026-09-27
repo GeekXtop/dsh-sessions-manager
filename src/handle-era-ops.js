@@ -129,6 +129,37 @@ function failureText(e) {
   return `${(e && e.name) || ''} ${(e && e.message) || e}`
 }
 
+// 0.1.7 起官方把 Session 格式升到 v4，create() 严格要求 header.version ===
+// 后端当前版本（`encodeCurrent requires Session format vN`）。旧代（v2/v3）
+// 会话的 header 直接透传必炸。从该错误里解析后端声明的当前版本号。
+function requiredFormatVersionFromError(e) {
+  const m = /requires Session format v(\d+)/.exec(String((e && e.message) || ''))
+  return m ? Number(m[1]) : null
+}
+
+// 官方 v2→v4 一直接受的 header 字段。旧代 header 可能携带后续版本已移除的
+// 字段（如 seedLength），而 v4 起严格拒绝任何未知字段（"unexpected field"），
+// 重试前必须把 header 收敛到这个长期稳定集合。
+const OFFICIAL_HEADER_FIELDS = ['id', 'createdAt', 'cwd', 'isSeeded', 'delegationDepth', 'parentSession', 'origin', 'agentPreset']
+
+// 兼容性 create：先用调用方/采样得到的 header 直接建；若后端以「版本不符」
+// 拒绝，则把版本号提到后端声明的当前值、字段收敛到官方稳定集合后重试一次。
+// 只重试这一类错误：真正的词汇表/事件校验错误原样上抛，绝不静默降级。
+async function createWithCompatibleHeader(sp, header, createOptions) {
+  try {
+    return await sp.create(header, createOptions)
+  } catch (e) {
+    const required = requiredFormatVersionFromError(e)
+    if (required === null || header.version === required) throw e
+    const normalized = {}
+    for (const key of OFFICIAL_HEADER_FIELDS) {
+      if (Object.hasOwn(header, key)) normalized[key] = header[key]
+    }
+    normalized.version = required
+    return await sp.create(normalized, createOptions)
+  }
+}
+
 function isAlreadyOwned(e) {
   return /already owned/i.test(failureText(e))
 }
@@ -278,7 +309,20 @@ export async function moveSessionToCwd({ sp, sid, header, canonical, events = []
     error.code = 'DSM_SESSION_DUP_LOG'
     throw error
   }
-  const newHeader = Object.assign({}, header, { cwd: canonical })
+  const newHeaderBase = Object.assign({}, header, { cwd: canonical })
+  // 写所有权探测可能已为旧代会话发布了当前代；探测成功后再用官方 stat 重新
+  // 采样一次 header —— 后端自己编码的 header 天然携带当前格式版本与完整词汇表
+  // （0.1.7 的 create 严格要求 header.version === 后端当前版本）。stat 失败则
+  // 保留调用方 header，交给 createWithCompatibleHeader 的错误驱动重试兜底。
+  let createHeader = newHeaderBase
+  if (typeof sp.stat === 'function') {
+    try {
+      const fresh = await sp.stat(sid)
+      if (fresh && fresh.header && fresh.header.id === sid) {
+        createHeader = Object.assign({}, fresh.header, { cwd: canonical })
+      }
+    } catch (e) { /* 保持调用方 header */ }
+  }
   const firstSeq = events.length ? Number(events[0].seq) : 0
   const replay = firstSeq !== 0 ? events.map((event, index) => ({ ...event, seq: index })) : events
   const createOptions = header.isSeeded && Number.isSafeInteger(inheritedEventCount) && inheritedEventCount > 0
@@ -298,7 +342,7 @@ export async function moveSessionToCwd({ sp, sid, header, canonical, events = []
   let writer = null
   try {
     try {
-      writer = await sp.create(newHeader, createOptions)
+      writer = await createWithCompatibleHeader(sp, createHeader, createOptions)
       for (let i = 0; i < replay.length; i += MOVE_BATCH) {
         await writer.append(replay.slice(i, i + MOVE_BATCH))
       }
