@@ -83,13 +83,14 @@ So held-open sessions get **deferred (queued) moves**:
 - **Results are no longer silent**: a background completion or a final give-up (5 consecutive non-lock failures) becomes a persisted notice, surfaced as a toast the next time a DSH page is open (give-ups include the reason). Notices stay on the server until acknowledged (up to 20, at most 7 days) — closing the page before the toast never loses one.
 - **To actually move an active session**: request the move (it queues), then **restart DSH and don't open that session first** — it completes a few seconds after startup. Pending entries survive restarts.
 
-### Session format v3 (DSH 0.1.5+)
+### Session formats v3 / v4 (DSH 0.1.5+ / 0.1.7+)
 
-DSH 0.1.5 upgrades the session log format to **v3**; the runtime performs the migration itself while reading:
+DSH 0.1.5 upgrades the session log format to **v3**, and 0.1.7 upgrades it again to **v4**; the runtime performs the migration itself while reading:
 
-- Migration is **automatic** and **keeps the original files** — so one session directory legitimately holds both `session.v2.jsonl.zstd` and `session.v3.jsonl.zstd`. This plugin always reads the **highest generation**, matching the runtime.
-- Migration is **one-way, with no downgrade read**: after upgrading to 0.1.5 and opening sessions, rolling the runtime back makes those sessions unreadable. Back up `~/.dsh/sessions` before a rollback.
-- Only **supported** old logs are migrated; unknown events, v2 events already carrying reserved v3 tags, or corrupted data are **refused without any repair**. Such sessions surface as `SessionFormatUnsupportedMigrationError` / `SessionFormatError` on read/move — the plugin cannot repair them and reports the error verbatim.
+- Migration is **automatic** and **keeps the original files** — so one session directory legitimately holds multiple generations side by side (`session.v2.jsonl.zstd` next to higher generations). This plugin always reads the **highest generation**, matching the runtime.
+- Migration is **one-way, with no downgrade read**: after opening sessions on a newer runtime, rolling the runtime back makes those sessions unreadable. Back up `~/.dsh/sessions` before a rollback.
+- Only **supported** old logs are migrated; unknown events or corrupted data are **refused without any repair**. Such sessions surface as `SessionFormatUnsupportedMigrationError` / `SessionFormatError` on read/move — the plugin cannot repair them and reports the error verbatim.
+- **Since 0.1.7 newly created sessions strictly require a v4 header**: from v3.7.2 this plugin re-samples the session header against the current backend's format during cross-workspace moves — sessions created in older formats (v3 and earlier) can be moved again, and the relocated copy lands directly on the current format (verified end-to-end against a real v3 log). Earlier plugin versions fail to move such sessions on 0.1.7.
 
 ## Screenshots
 
@@ -209,7 +210,8 @@ lib/client.js      pre-built client (ModuleLoader CJS handshake)
 - Peer dependencies are listed in `package.json`; `react` and `@deepseek-ai/*` are provided by the DSH runtime.
 - `0.1.2-rc.1`: the existing read, archive, recycle-bin, permanent-purge, and cross-workspace move paths remain available.
 - `0.1.3-alpha.1`: snapshot lists and chunked `SessionHandle` read flows are supported. Permanent purge and cross-workspace move are available through guarded path derivation + write-ownership probes (see the behavior notes below), and disable themselves whenever a safe path cannot be verified; other management capabilities are unaffected. The panel shows the effective capabilities.
-- `0.1.5-rc.1` / `0.1.5-rc.2` (current runtimes; the two are byte-identical across every API this plugin uses, both verified): the session log format is upgraded to **v3** and this plugin is adapted — it reads the **highest generation** (matching the runtime), tolerates v0/v2/v3 generations side by side, follows the new `SessionHandle.read()` shape (`{ eventState, events }`), moves sessions as **whole-directory moves** (reclaiming superseded-generation copies automatically), and queues moves for sessions DSH holds open (see "Moving an active session" above).
+- `0.1.5-rc.1` / `0.1.5-rc.2` (both verified): the session log format is upgraded to **v3** and this plugin is adapted — it reads the **highest generation** (matching the runtime), tolerates v0/v2/v3 generations side by side, follows the new `SessionHandle.read()` shape (`{ eventState, events }`), moves sessions as **whole-directory moves** (reclaiming superseded-generation copies automatically), and queues moves for sessions DSH holds open (see "Moving an active session" above).
+- `0.1.7-rc.2` (verified): the session format is upgraded again to **v4** and the format catalog moves to its own package; this plugin is adapted — reads go through the official automatic migration, and cross-workspace moves re-sample the header against the backend's current format (sessions created on older formats can be moved again, and the relocated copy lands on the current format).
 - Unverified future runtimes expose only capabilities the plugin can safely identify; method presence alone is not presented as behavioral compatibility.
 
 ### Behavior differences and degradations on the SessionHandle era (`0.1.3+`)
