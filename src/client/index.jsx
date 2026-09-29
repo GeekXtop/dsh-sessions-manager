@@ -244,15 +244,58 @@ async function postJSON(path, body) {
 
 // 打开一个会话（尤其是侧栏不渲染的子代理会话）。
 //
-// 只走官方公开契约（runtime 的 client api-catalog）：
-//   sessions.open(id)                 —— 选中会话为当前
-//   sessions.refreshSubagents(parent) —— 刷新某父会话的直接子代理目录
-//   sessions.openSubagent(address)    —— 用「直接父 + 子」地址打开目录里的子代理
-// 拿不到 sessions 服务（老 runtime）时返回 false，由调用方给出降级提示，绝不
-// 触碰任何私有内部状态。
+// 只走官方公开契约，按方法存在性分支、不写死核心版本：
+//   旧核心（≤0.1.6）  ctx.get('sessions') 自带
+//     sessions.open(id)                 —— 选中会话为当前
+//     sessions.refreshSubagents(parent) —— 刷新某父会话的直接子代理目录
+//     sessions.openSubagent(address)    —— 用「直接父 + 子」地址打开目录里的子代理
+//   新核心（0.1.7+ / 0.2.0+）sessions 退化为会话数据流服务（retain/release/
+//     readPage…，没有 open），切换会话的公开入口是 uiWorkspace.openSession(target)：
+//     target 为会话 id 字符串，或 {parentSessionId, childSessionId, mode} 子代理
+//     地址（与旧 openSubagent 契约同形，replaceMain 经 sessions.retain 原生支持；
+//     id 命中已加载目录的子代理时核心会自动解析地址）。核心侧栏点会话走的就是
+//     这条路径（dsh-workspace-kit 0.1.12 起同样从 ctx.sessions.open 迁移过来）。
+// 拿不到任何服务时返回 null，由调用方给出降级提示，绝不触碰私有内部状态。
 let dsmClientCtx = null
 function dsmSessionsService() {
-  try { return dsmClientCtx && typeof dsmClientCtx.get === 'function' ? dsmClientCtx.get('sessions') : null } catch (e) { return null }
+  try {
+    if (!dsmClientCtx || typeof dsmClientCtx.get !== 'function') return null
+    const native = dsmClientCtx.get('sessions')
+    if (native && (typeof native.open === 'function' || typeof native.openSubagent === 'function')) return native
+    const ui = dsmClientCtx.get('uiWorkspace')
+    if (!ui || typeof ui.openSession !== 'function') return native
+    let lastOpened = null
+    const bridge = {
+      open(id) {
+        if (id === null || id === undefined) return
+        const target = String(id)
+        // 地址未加载的子代理会在这里被核心拒绝（unknown session），调用方
+        // 依赖抛错落回 openSubagent 地址路径，因此不吞异常。
+        ui.openSession(target)
+        lastOpened = target
+      },
+      openSubagent(address) {
+        if (address === null || address === undefined) return
+        if (typeof address === 'object') {
+          // 逐字段原样透传（parentSessionId / childSessionId / mode），新核心
+          // 的 retain 直接以该地址解析历史路由。
+          ui.openSession(address)
+          lastOpened = String(address.childSessionId)
+        } else {
+          bridge.open(address)
+        }
+      },
+      // 新核心的子代理目录由投影自动维护，无需手动刷新。
+      refreshSubagents() {},
+    }
+    // dsmCurrentSessionId 走 list.getSnapshot().current 校验切换结果；桥接下
+    // 核心未公开等价快照，以自己最近一次成功提交的目标为准。
+    Object.defineProperty(bridge, 'list', {
+      configurable: true,
+      get() { return { getSnapshot: () => ({ current: lastOpened }) } },
+    })
+    return bridge
+  } catch (e) { return null }
 }
 function dsmCurrentSessionId(svc) {
   try {
