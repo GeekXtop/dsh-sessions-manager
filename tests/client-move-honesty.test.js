@@ -23,10 +23,14 @@ const WINDOW = 600
 
 function moveCallSites(source) {
   const out = []
+  // 移动请求要么直接 postJSON，要么经 postActiveAware（先同步活跃会话再发）。
+  // 两条路径都得落进同一套守卫：新增入口只要没判断 queued 就红。
   for (const route of ["'/archived-sessions/move'", "'/archived-sessions/move-many'"]) {
-    let i = -1
-    while ((i = source.indexOf('postJSON(' + route, i + 1)) >= 0) {
-      out.push({ route: route.replace(/'/g, ''), at: i, window: source.slice(i, i + WINDOW) })
+    for (const call of ['postJSON(', 'postActiveAware(']) {
+      let i = -1
+      while ((i = source.indexOf(call + route, i + 1)) >= 0) {
+        out.push({ route: route.replace(/'/g, ''), at: i, window: source.slice(i, i + WINDOW) })
+      }
     }
   }
   return out

@@ -24,6 +24,7 @@ import { createAutoArchiveStore, pickInactiveCandidates } from './auto-archive.j
 import { createSessionMetaCache, fingerprintOf, persistFingerprintOf } from './session-meta-cache.js'
 import { createTitleIndexStore } from './title-persist-index.js'
 import { createEmptyScanStore } from './empty-scan-index.js'
+import { createActiveSessionTracker } from './active-session.js'
 import { createPersistenceAdapter } from './compat/persistence.js'
 import { detectCapabilities, requireCapability } from './compat/capabilities.js'
 import { pathOwnsSession } from './path-guard.js'
@@ -124,7 +125,12 @@ function requireSessionId(value) {
 // few known accessors for the active id; if none is available we return null
 // and callers should treat the session as movable (the move path is
 // crash-safe via backup+rollback and re-syncs the live object afterwards).
-function getActiveSessionId(context) {
+//
+// 这些访问器只在旧核心（≤0.1.6）里存在。0.1.7+ / 0.2.x 把「当前选中哪个会话」
+// 完全移到了客户端（uiWorkspace 持 mainView 引用），host 侧三个探测全部落空 →
+// 恒 null。所以真正的判定入口是下面的 getActiveSessionIds（客户端心跳优先），
+// 这个函数退化为旧核心的兜底探测。
+function legacyActiveSessionId(context) {
   try {
     const a = context.get('activeSession')
     if (a != null) return (a && a.id != null) ? a.id : (typeof a === 'string' ? a : null)
@@ -138,6 +144,15 @@ function getActiveSessionId(context) {
     if (store && store.active && store.active.id != null) return store.active.id
   } catch (e) { /* no such key */ }
   return null
+}
+
+// 活跃会话判定：优先采信客户端心跳（0.1.7+ 唯一可信来源），没有心跳才退回旧核心
+// 访问器探测。心跳过期/没有客户端连接 → 空集合，调用方按「无法证明活跃」处理。
+function getActiveSessionIds(context, tracker) {
+  const reported = tracker ? tracker.activeIds() : null
+  if (reported && reported.size) return reported
+  const legacy = legacyActiveSessionId(context)
+  return legacy != null ? new Set([String(legacy)]) : new Set()
 }
 
 // foldTitle（v3.6.1 删除路径的兜底折叠）随 v3.6.2 #7 的「删除路径零解码」一并
@@ -162,6 +177,9 @@ export function apply(ctx) {
   // T1（3.7.0）：空白精判结论的持久层。只有**真解码成功**的判定落盘（unknown
   // 与失败兜底都不是结论），sz 指纹 + 14 天 TTL 双闸门防「同尺寸原地改写」。
   const emptyIndex = createEmptyScanStore({ dir: TRASH_DIR })
+  // 活跃会话（客户端心跳上报，见 src/active-session.js）：0.1.7+ host 侧无法
+  // 自行判断「用户正在看哪个会话」，靠客户端周期性上报。过期即失效。
+  const activeTracker = createActiveSessionTracker()
   const EMPTY_VERDICT_TTL_MS = 14 * 24 * 3600 * 1000
 
   // P4：对「内存缓存未命中」的会话查持久索引，指纹一致才可信。
@@ -960,8 +978,9 @@ export function apply(ctx) {
     // merely looked at. When the host exposes no active-session accessor we
     // can't prove activeness, so we allow the move; the relocation below is
     // crash-safe (backup + rollback) and re-syncs the live object.
-    const activeId = getActiveSessionId(ctx)
-    if (activeId != null && String(activeId) === String(sid)) {
+    const activeIds = getActiveSessionIds(ctx, activeTracker)
+    const activeId = activeIds.values().next().value != null ? activeIds.values().next().value : null
+    if (activeIds.has(String(sid)) || (activeId != null && String(activeId) === String(sid))) {
       const error = new Error('会话正被 DSH 打开，暂时无法移动；请重启 DSH 后再试。')
       error.status = 409
       error.code = 'DSM_SESSION_BUSY'
@@ -1559,7 +1578,7 @@ export function apply(ctx) {
     const candidates = pickInactiveCandidates(items, {
       inactiveDays: days,
       skipStarred: store.settings.skipStarred,
-      activeSessionId: getActiveSessionId(ctx),
+      activeSessionIds: [...getActiveSessionIds(ctx, activeTracker)],
       now,
     })
     let archived = 0
@@ -1904,6 +1923,25 @@ export function apply(ctx) {
       kind: 'exact',
       path: '/archived-sessions/capabilities',
       handler: async (req, res) => json(res, { ...capabilities, buildStamp: BUILD_STAMP }),
+    }))
+
+    // 活跃会话心跳（客户端 → host）。0.1.7+ 起 host 无从得知 UI 当前选中了哪个
+    // 会话（见 src/active-session.js），只能由客户端上报；host 只在心跳新鲜期内
+    // 采信，用它拦住「移动正在看的会话」和「自动归档正在看的会话」。
+    // body: { clientId, sessionId|null }。sessionId 为空 = 该客户端当前无活跃会话。
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/active-session',
+      handler: async (req, res) => {
+        const body = await readJsonBody(req)
+        const clientId = body && typeof body.clientId === 'string' ? body.clientId : 'default'
+        const sid = body && typeof body.sessionId === 'string' && body.sessionId ? body.sessionId : null
+        const accepted = activeTracker.report(clientId, sid)
+        json(res, {
+          ok: accepted,
+          activeSessionIds: [...activeTracker.activeIds()],
+        })
+      },
     }))
 
     disposers.push(ctx.webServer.register({

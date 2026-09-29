@@ -336,6 +336,73 @@ async function dsmOpenSessionById(childId, directParentId) {
   return 'failed'
 }
 
+// ---- 活跃会话上报：host 判定「用户正在看哪个会话」的唯一来源 ----------------
+//
+// 0.1.7+ / 0.2.x 的 host 进程里没有 activeSession / currentSession /
+// sessions.active 任何一个访问器（实测三个探测全部落空），它根本无从判断用户在
+// 看哪个会话——但必须判断，否则两条保护形同虚设：
+//   * 移动：活跃会话被写锁持有，硬动盘要排队（409 / queued）
+//   * 自动归档：正在看的会话不该被默默归档掉
+// 能看到 UI 状态的是客户端，所以由它周期性上报；host 只在心跳新鲜期内采信
+// （见 src/active-session.js 的 TTL 说明：过期即失效，宁可漏判也不误判）。
+//
+// 探测顺序：uiWorkspace 的 selection 快照（持久化在 dsh.sessions.current，即
+// 启动时恢复的那个选中项，最权威）→ uiWorkspace 的 mainView 引用（mainReference）
+// → 旧核心 sessions.list.getSnapshot().current。
+// 前两者是客户端服务对象上的字段，全部 try/catch 包裹：上游改名/重构只会退化成
+// 「探测不到」（放行移动，移动路径本身有写锁 + 备份回滚兜底），不会抛错。
+const DSM_CLIENT_ID = (() => {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  } catch (e) { /* 非安全上下文没有 randomUUID */ }
+  return `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
+})()
+
+export function dsmActiveSessionId() {
+  try {
+    if (!dsmClientCtx || typeof dsmClientCtx.get !== 'function') return null
+    const ui = dsmClientCtx.get('uiWorkspace')
+    if (ui) {
+      const snap = ui.selection && typeof ui.selection.getSnapshot === 'function' ? ui.selection.getSnapshot() : null
+      if (snap && snap.sessionId != null) return String(snap.sessionId)
+      const ref = ui.mainReference
+      if (ref && ref.sessionId != null) return String(ref.sessionId)
+    }
+    const native = dsmClientCtx.get('sessions')
+    if (native && native.list && typeof native.list.getSnapshot === 'function') {
+      const snap = native.list.getSnapshot()
+      if (snap && snap.current != null) return String(snap.current)
+    }
+  } catch (e) { /* 服务不可用/字段不存在 */ }
+  return null
+}
+
+const DSM_ACTIVE_HEARTBEAT_MS = 15000
+const DSM_ACTIVE_MIN_REPORT_MS = 30000
+let dsmLastActiveReport = { id: null, at: 0 }
+
+/**
+ * 上报当前会话。心跳（force=false）在「值没变 + 距上次不足 30s」时跳过网络请求；
+ * force=true 用于移动前强制同步——用户在心跳间隔内刚切过会话时，host 手里还是旧值。
+ */
+async function reportActiveSession(force) {
+  const id = dsmActiveSessionId()
+  const now = Date.now()
+  if (!force && id === dsmLastActiveReport.id && now - dsmLastActiveReport.at < DSM_ACTIVE_MIN_REPORT_MS) return
+  dsmLastActiveReport = { id, at: now }
+  try {
+    await postJSON('/archived-sessions/active-session', { clientId: DSM_CLIENT_ID, sessionId: id })
+  } catch (e) { /* host 未就绪 / 路由缺失：静默，下个心跳再试 */ }
+}
+
+// 移动类请求：先同步一次活跃会话，再发真正的移动请求。否则 host 拿旧值放行，
+// 移动中的会话恰好是用户刚切过去的那个（写锁持有 → 只能排队，UI 上表现为「排队」
+// 而不是「已移动」——不算错，但用户点之前本可以选别的会话）。
+async function postActiveAware(path, body) {
+  await reportActiveSession(true).catch(() => null)
+  return postJSON(path, body)
+}
+
 // Left-nav icon swap: DSH's settings shell renders a shared fallback gear for
 // every custom section and settings.section has no per-section icon field.
 // Like dsh-better-sidebar, we mark our own row by matching its visible label
@@ -1320,7 +1387,7 @@ function SessionPanel({ workspacesSvc }) {
     if (!targetPath) { setError('请选择已有工作区或输入新的目标目录路径'); return }
     setBusy(it.sessionId)
     setError(null)
-    postJSON('/archived-sessions/move', { sessionId: it.sessionId, targetPath })
+    postActiveAware('/archived-sessions/move', { sessionId: it.sessionId, targetPath })
       .then((r) => {
         setBusy(null)
         setOpenMove(null)
@@ -1380,7 +1447,7 @@ function SessionPanel({ workspacesSvc }) {
     setBusy('__batch__')
     setError(null)
     setRetry(null)
-    postJSON('/archived-sessions/move-many', { sessionIds: ids, targetPath })
+    postActiveAware('/archived-sessions/move-many', { sessionIds: ids, targetPath })
       .then((r) => {
         setBusy(null)
         setBatchMoveOpen(false)
@@ -2756,7 +2823,7 @@ function installSidebarSessionMenuAug() {
           e.preventDefault()
           closeSub()
           closeMenu()
-          postJSON('/archived-sessions/move', { sessionId: info.id, targetPath: w.path })
+          postActiveAware('/archived-sessions/move', { sessionId: info.id, targetPath: w.path })
             .then((r) => {
               // 会话被 DSH 打开（活跃/未关闭）时服务端只登记排队：磁盘与工作区分组都没动。
               // 这条路径原先无条件报「移动成功」——2026-09-10 用户报的「说移动成功但还在
@@ -3501,7 +3568,7 @@ function installSidebarWorkspaceDrag() {
     clearVisuals()
     row.classList.add('dsm-drag-busy')
     try {
-      const result = await postJSON('/archived-sessions/move', { sessionId: item.sessionId, targetPath: target.path })
+      const result = await postActiveAware('/archived-sessions/move', { sessionId: item.sessionId, targetPath: target.path })
       // 会话被 DSH 打开时服务端只登记排队：磁盘与工作区分组都没动。这条路径绝不能
       // 本地改行 + 报成功——那会让用户以为移动已完成，而侧栏刷新后该行又跳回原工作区
       //（用户 2026-09-10 报的「说移动成功但还在原工作区」就是这个）。排队时只如实说明。
@@ -3567,6 +3634,20 @@ function installSidebarWorkspaceDrag() {
 export function apply(ctx) {
   dsmClientCtx = ctx
   dsmLoadCapabilities()
+  // 活跃会话心跳：页面隐藏时不发（用户没在看；host 侧 TTL 到期后自然失效，
+  // 于是「无法证明活跃」→ 放行移动，不会把会话永久锁死）。
+  const beat = () => {
+    if (typeof document !== 'undefined' && document.hidden) return
+    reportActiveSession(false).catch(() => {})
+  }
+  beat()
+  const beatTimer = setInterval(beat, DSM_ACTIVE_HEARTBEAT_MS)
+  const beatAc = typeof AbortController !== 'undefined' ? new AbortController() : null
+  if (beatAc && typeof document !== 'undefined' && document.addEventListener) {
+    // 标签页重新可见：立刻补一次（切回来后第一件事就可能是移动）。
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) beat() }, { signal: beatAc.signal })
+  }
+  ctx.effect(() => () => { clearInterval(beatTimer); if (beatAc) beatAc.abort() })
   installSettingsNavIcons(ctx)
   installSidebarSessionMenuAug()
   // 侧栏增强的卸载清退挂到 cordis effect：插件停用/HMR 时 interval、

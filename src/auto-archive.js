@@ -62,6 +62,9 @@ export function normalizeAutoArchiveStore(raw) {
  * @param {number} [options.now] - Reference timestamp (tests inject it).
  * @param {boolean} [options.skipStarred=true] - Keep starred sessions.
  * @param {string|null} [options.activeSessionId] - Never archive the open one.
+ * @param {Array<string>} [options.activeSessionIds] - Same, for several clients
+ *   (browser + desktop can each hold their own open session). Takes precedence
+ *   over `activeSessionId` when given.
  * @returns {string[]} Session ids to archive.
  */
 export function pickInactiveCandidates(items, options = {}) {
@@ -70,7 +73,11 @@ export function pickInactiveCandidates(items, options = {}) {
   const now = Number.isFinite(options.now) ? options.now : Date.now()
   const cutoff = now - days * DAY_MS
   const skipStarred = options.skipStarred !== false
-  const activeId = options.activeSessionId != null ? String(options.activeSessionId) : null
+  const activeIds = new Set(
+    Array.isArray(options.activeSessionIds)
+      ? options.activeSessionIds.map((id) => String(id))
+      : options.activeSessionId != null ? [String(options.activeSessionId)] : [],
+  )
   const list = Array.isArray(items) ? items : []
 
   const out = []
@@ -81,7 +88,7 @@ export function pickInactiveCandidates(items, options = {}) {
     if (seen.has(id)) continue
     if (item.archived) continue
     if (skipStarred && item.starred) continue
-    if (activeId !== null && id === activeId) continue
+    if (activeIds.has(id)) continue
     const updatedAt = Number(item.updatedAt)
     // No usable timestamp → cannot prove it is idle → leave it alone.
     if (!Number.isFinite(updatedAt) || updatedAt <= 0) continue
