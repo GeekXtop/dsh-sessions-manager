@@ -390,6 +390,174 @@ try {
     await rm(process.env.DSH_SESSIONS_MANAGER_TRASH_DIR, { recursive: true, force: true }).catch(() => {})
   }
 
+  // ---- DOMAIN-level route smoke: 真实 storageDomain + 真实 workspaceRegistry --
+  // 背景：上面那节把 storageDomain stub 成了旧形状（{ global: { get, set } }），
+  // 于是「归档状态落进官方域」这条路径从未被真实后端碰过——而 0.2.0 的
+  // storageDomain 是 DomainFacility：get(name) 只返回**已打开**的域，域的 global
+  // 由 zod schema 校验（未知键会被 strip，写错字段不会报错但重启后消失）。
+  // 本节把 storage 枢纽 + json 后端 + 领域设施 + 官方 WorkspaceRegistry 全真起一遍，
+  // 在真栈上跑归档 / 恢复 / 标签 / 统计 / 移动路由，并回到磁盘介质核验归档状态
+  // 真的持久化了（内存态不算数）。
+  // runtime 缺包（0.1.7 及更早没有 storage-domain）时整段跳过，不算失败。
+  {
+    const resolvePkgDir = (n) => {
+      try { return dirname(requireFrom(pkgs.persistence).resolve(`@deepseek-ai/${n}/package.json`)) } catch (e) { return null }
+    }
+    const dirStorage = resolvePkgDir('dsh-storage')
+    const dirStorageJson = resolvePkgDir('dsh-storage-json')
+    const dirDomain = resolvePkgDir('dsh-storage-domain')
+    const dirWorkspace = resolvePkgDir('dsh-workspace')
+    if (!dirStorage || !dirStorageJson || !dirDomain || !dirWorkspace) {
+      console.log('  · domain-level smoke skipped（runtime 缺少 storage / storage-json / storage-domain / workspace 包）')
+    } else {
+      const loadLib = (dir) => import(pathToFileURL(join(dir, 'lib/index.js')).href)
+      const storageMod = await loadLib(dirStorage)
+      const jsonMod = await loadLib(dirStorageJson)
+      const domainMod = await loadLib(dirDomain)
+      const wsMod = await loadLib(dirWorkspace)
+      const pluginMod = await import(`../src/index.js?domain=${Date.now()}`)
+      const { mkdir: mkdirP, readdir: readdirP, readFile: readFileP } = await import('node:fs/promises')
+      const { realpath: realpathP } = await import('node:fs/promises')
+
+      const dataDir = await mkdtemp(join(tmpdir(), 'dsm-runtime-domain-'))
+      const sessRoot = await mkdtemp(join(tmpdir(), 'dsm-runtime-domain-sess-'))
+      const tmpTrash = await mkdtemp(join(tmpdir(), 'dsm-runtime-domain-trash-'))
+      const tmpPending = await mkdtemp(join(tmpdir(), 'dsm-runtime-domain-pending-'))
+      const tmpStar = await mkdtemp(join(tmpdir(), 'dsm-runtime-domain-star-'))
+      const tmpAuto = await mkdtemp(join(tmpdir(), 'dsm-runtime-domain-aa-'))
+      process.env.DSH_SESSIONS_MANAGER_TRASH_DIR = tmpTrash
+      process.env.DSH_SESSIONS_MANAGER_PENDING_DIR = tmpPending
+      process.env.DSH_SESSIONS_MANAGER_STAR_DIR = tmpStar
+      process.env.DSH_SESSIONS_MANAGER_AUTO_ARCHIVE_DIR = tmpAuto
+      // 插件自有状态目录必须先存在（star/tag/auto-archive 不会自己建）。
+      await mkdirP(tmpTrash, { recursive: true })
+
+      // 两个真实工作区目录（会话 cwd 与 workspace path 必须完全一致，官方
+      // registry 按 header.cwd 分组）。路径一律 realpath（macOS /var → /private/var）。
+      const wsA = await realpathP(await (async () => { const d = join(sessRoot, 'ws-a'); await mkdirP(d, { recursive: true }); return d })())
+      const wsB = await realpathP(await (async () => { const d = join(sessRoot, 'ws-b'); await mkdirP(d, { recursive: true }); return d })())
+
+      const domRoutes = new Map()
+      const domCtx = typeof cordis === 'function' ? new cordis() : new cordis.Context()
+      domCtx.plugin(storageMod.default)
+      domCtx.plugin(jsonMod, { root: dataDir })
+      domCtx.plugin(domainMod, { backend: 'json' })
+      domCtx.plugin(JsonlSessionPersistence, { root: sessRoot })
+      domCtx.provide('webServer', { register: (route) => { domRoutes.set(route.path, route.handler); return () => {} } })
+      domCtx.provide('sessionQuery', {
+        readTitleSnapshots: async (ids) => ids.map((id) => ({ status: 'fulfilled', value: { session: { id }, title: { title: `Domain ${id}` } } })),
+      })
+      domCtx.provide('sessions', { list: () => [], get: () => undefined })
+
+      let smokeError = null
+      let releaseSmoke = null
+      const smokeDone = new Promise((resolve) => { releaseSmoke = resolve })
+      domCtx.plugin({
+        name: 'dsm-domain-smoke',
+        inject: ['webServer', 'sessionPersistence', 'sessionQuery', 'storageDomain'],
+        apply: async (c) => {
+          try {
+            const sp = c.sessionPersistence
+            const sidA = `dom-a-${Date.now().toString(36)}`
+            const sidB = `dom-b-${Date.now().toString(36)}`
+            for (const [sid, cwd] of [[sidA, wsA], [sidB, wsA]]) {
+              const writer = await sp.create({ id: sid, cwd, createdAt: Date.now(), version: CURRENT_FORMAT_VERSION, isSeeded: false, delegationDepth: 0 })
+              await writer.append(mkBatch(0, 2))
+              await writer.flush()
+              await writer.close()
+            }
+            // 先建会话、再起官方 registry：init 会按磁盘上的 header 建立工作区索引。
+            const registry = new wsMod.WorkspaceRegistry(c)
+            await registry[wsMod.WorkspaceRegistry.init]()
+            check('domain: official workspace domain is open', !!c.storageDomain.get('workspace'))
+            const global0 = c.storageDomain.get('workspace').global.get()
+            check('domain: global carries archivedSessionIds (schema 校验通过)',
+              Array.isArray(global0.archivedSessionIds), Object.keys(global0))
+            check('registry: real entities built from the durable order',
+              registry.list().length >= 1 && registry.list().some((e) => e.path === wsA),
+              registry.list().map((e) => e.path))
+
+            // 挂载被测插件（真栈）：webServer / storageDomain / workspaceRegistry
+            // / sessionQuery 全部来自真实服务。
+            // 直接 apply：路由注册发生在 apply 里，必须在此刻同步完成；交给
+            // ctx.plugin() 则是异步加载（依赖注入要等服务就绪），请求会打到
+            // 尚未注册的 handler 上。服务可用性由上面的断言保证。
+            pluginMod.apply(c)
+            const callDom = async (path, body = {}) => {
+              const { Readable } = await import('node:stream')
+              const req = Readable.from([Buffer.from(JSON.stringify(body))])
+              let status = 200
+              let text = ''
+              const res = { writeHead: (value) => { status = value }, end: (value) => { text += value || '' } }
+              await domRoutes.get(path)(req, res)
+              return { status, body: JSON.parse(text) }
+            }
+
+            const arch = await callDom('/archived-sessions/archive', { sessionId: sidA })
+            check('route /archive (real domain): 200 + archived', arch.status === 200 && arch.body.archived === true, arch.body)
+            check('domain: archive flag visible through the real global handle',
+              c.storageDomain.get('workspace').global.get().archivedSessionIds.includes(sidA),
+              c.storageDomain.get('workspace').global.get().archivedSessionIds)
+            // 落盘核验：领域写入在 resolve 前已持久。内存态不算数。
+            const mediumText = await (async () => {
+              const out = []
+              const walk = async (dir) => {
+                for (const ent of await readdirP(dir, { withFileTypes: true })) {
+                  const p = join(dir, ent.name)
+                  if (ent.isDirectory()) await walk(p)
+                  else if (/\.json$/i.test(ent.name)) out.push(await readFileP(p, 'utf8'))
+                }
+              }
+              await walk(dataDir)
+              return out.join('\n')
+            })()
+            check('domain: archive state reached the storage medium (not memory only)', mediumText.includes(sidA))
+
+            const listed = await callDom('/archived-sessions/list', {})
+            check('route /list (real domain): archived session surfaced',
+              (listed.body.items || []).some((it) => it.sessionId === sidA),
+              (listed.body.items || []).map((it) => it.sessionId))
+
+            const restored = await callDom('/archived-sessions/restore', { sessionId: sidA })
+            check('route /restore (real domain): flag cleared',
+              restored.status === 200 && restored.body.restored === true
+                && !c.storageDomain.get('workspace').global.get().archivedSessionIds.includes(sidA),
+              restored.body)
+
+            // 标签（插件自有存储，非官方域）：create → set → list 往返。
+            const created = await callDom('/archived-sessions/tags/create', { name: 'dom-tag' })
+            const tagId = created.body && created.body.tag && created.body.tag.id
+            const tagSet = await callDom('/archived-sessions/tags/set', { sessionId: sidA, tagIds: tagId ? [tagId] : [] })
+            const tagList = await callDom('/archived-sessions/tags/list', {})
+            check('route /tags: create → set → list round-trip',
+              !!tagId && tagSet.status === 200 && (tagList.body.tags || []).some((t) => t.id === tagId),
+              { tagId, status: tagSet.status })
+
+            const stats = await callDom('/archived-sessions/storage', { topN: 3 })
+            check('route /storage (real backend): counts the real log bytes',
+              stats.status === 200 && stats.body.sessionCount >= 1 && stats.body.totalBytes > 0, stats.body)
+
+            const moved = await callDom('/archived-sessions/move', { sessionId: sidA, targetPath: wsB })
+            check('route /move (real registry): session relocates to the target workspace',
+              moved.status === 200 && (moved.body.moved === true || moved.body.already === true), moved.body)
+            const movedStat = await sp.stat(sidA)
+            check('route /move (real registry): official stat carries the new cwd',
+              !!movedStat && movedStat.header.cwd === wsB, movedStat && movedStat.header.cwd)
+          } catch (e) {
+            smokeError = e
+          } finally {
+            releaseSmoke()
+          }
+        },
+      })
+      await smokeDone
+      if (smokeError) throw smokeError
+      for (const dir of [dataDir, sessRoot, tmpTrash, tmpPending, tmpStar, tmpAuto]) {
+        await rm(dir, { recursive: true, force: true }).catch(() => {})
+      }
+    }
+  }
+
   // ---- LEGACY-generation migration smoke (optional --legacy-log <path>) ----
   // 指向一个真实旧代会话日志（如 ~/.dsh/sessions/<project>/<id>/session.v3.jsonl.zstd），
   // **拷贝**进临时 root（原件绝不触碰），验证三件事：
