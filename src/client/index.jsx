@@ -32,6 +32,10 @@ const CSS = `
    仍是白底，叠加未适配的文字色导致不可读；跟随 DSH 的暗色主题标记切换。 */
 .archv{color-scheme:light}
 body[data-ds-dark-theme] .archv{color-scheme:dark}
+/* 兜底：原生弹层行的配色直接写在 option 上（Chromium 按 option 自身的
+   background/color 绘制弹层），即使 color-scheme 判定被扩展或环境干扰，
+   暗色下也不会出现白底配浅色文字的不可读组合。 */
+.archv option{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
 .archv{--dsm-radius-tag:9px;--dsm-radius-ctl:9px;--dsm-radius-sheet:10px;--dsm-radius-card:12px;display:flex;flex-direction:column;gap:4px;max-width:800px;padding:8px 2px 28px}
 .archv-head{display:flex;align-items:center;gap:10px;margin:0 0 2px}
 .archv-title{font-size:16px;font-weight:650;color:var(--dsw-alias-label-primary);letter-spacing:-0.01em;margin:0}
