@@ -960,8 +960,9 @@ function SessionPanel({ workspacesSvc }) {
         const ok = document.execCommand('copy')
         ta.remove()
         if (ok) markCopied()
-        else showToast('复制失败：可在「会话详情」面板手动选择复制', 'err')
-      } catch (e) { showToast('复制失败：' + String((e && e.message) || e), 'err') }
+        // 复制全链路失败的终点兜底：值直接亮进 toast，肉眼可读可抄（对齐上游 copyBuildStamp 的失败终点）。
+        else showToast('复制失败，完整 ID：' + id, 'err')
+      } catch (e) { showToast('复制失败，完整 ID：' + id, 'err') }
     }
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(id).then(markCopied).catch(viaExecCommand)
