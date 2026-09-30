@@ -49,8 +49,11 @@ const CSS = `
 .sess-fbtn-on{background:var(--dsw-alias-interactive-bg-active);color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l3)}
 .sess-tools{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin:0 0 8px}
 .sess-tools-4{grid-template-columns:repeat(auto-fit,minmax(132px,1fr))}
-/* T4 起搜索行有 5 个字段（搜索/工作区/标签/排序/分组）：收窄下限保证 800px 内一行排满。 */
-.sess-tools-5{grid-template-columns:repeat(auto-fit,minmax(124px,1fr))}
+/* T4 起搜索行有 5 个字段（搜索/工作区/标签/排序/分组）：固定 5 列 + minmax(0,1fr)
+   一行排满——auto-fit(minmax(124px,…)) 在面板宽度不足 5×124+gap 时会把最后
+   一列挤到第二行（分组孤行）。minmax(0,1fr) 允许列均分收缩，select/input
+   各自截断；<640px 仍由下方断点收成单列。 */
+.sess-tools-5{grid-template-columns:repeat(5,minmax(0,1fr))}
 .dsm-kids{display:flex;flex-direction:column;gap:6px;margin:10px 0 2px;margin-left:43px;padding-left:10px;border-left:2px solid var(--dsw-alias-border-l3)}
 .dsm-kid .dsm-kids{margin-left:8px;margin-top:6px}
 .dsm-kids-toggle{appearance:none;min-height:22px;padding:0 9px;border:1px solid color-mix(in srgb,var(--dsw-alias-state-business-primary) 40%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 10%,transparent);color:var(--dsw-alias-state-business-primary);border-radius:var(--dsm-radius-tag);font:inherit;font-size:11px;font-weight:500;cursor:pointer;flex:none;white-space:nowrap}
@@ -1608,7 +1611,11 @@ function SessionPanel({ workspacesSvc }) {
       <div className="archv-head">
         <h2 className="archv-title">会话管理</h2>
         {capabilities && capabilities.buildStamp
-          ? <span className="archv-stamp" title={capabilities.buildStamp} onClick={() => navigator.clipboard && navigator.clipboard.writeText(capabilities.buildStamp).catch(() => {})}>{capabilities.buildStamp}</span>
+          ? <span
+              className="archv-stamp"
+              title={capabilities.buildStamp}
+              onClick={() => navigator.clipboard && navigator.clipboard.writeText(capabilities.buildStamp).catch(() => {})}
+            >v{String(capabilities.buildStamp).split('+')[0]}</span>
           : null}
         {sessions !== null && <span className="archv-count" aria-label={`${sessions.length} 个会话`}>{sessions.length}</span>}
       </div>
@@ -1895,8 +1902,8 @@ function SessionPanel({ workspacesSvc }) {
                 <div className="sess-field">
                   <label htmlFor="dsm-group">分组</label>
                   <select id="dsm-group" value={groupByLineage ? 'lineage' : 'flat'} onChange={(e) => setGroupByLineage(e.target.value === 'lineage')} title="血缘分组：子代理折叠、分支聚拢成组；平铺：与 DSH 原生一致，全部并列">
-                    <option value="lineage">血缘（折叠分组）</option>
-                    <option value="flat">平铺（全部并列）</option>
+                    <option value="lineage">血缘（折叠）</option>
+                    <option value="flat">平铺（并列）</option>
                   </select>
                 </div>
               </div>
