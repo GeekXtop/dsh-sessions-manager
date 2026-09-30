@@ -40,7 +40,7 @@ test('store: append/list/ack 幂等，坏数据宽容，TTL 过期不投递', as
     // 落盘 0600。
     const st = await readFile(join(dir, 'move-notices.json')) && await (await import('node:fs/promises')).stat(join(dir, 'move-notices.json'))
     assert.equal(st.mode & 0o777, 0o600)
-  } finally { await rm(dir, { recursive: true, force: true }) }
+  } finally { await rm(dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }) }
 })
 
 test('store: 超 MAX_NOTICES 截断保留最新', async () => {
@@ -51,7 +51,7 @@ test('store: 超 MAX_NOTICES 截断保留最新', async () => {
     const list = await store.list()
     assert.equal(list.length, MAX_NOTICES)
     assert.equal(list[list.length - 1].sessionId, `s${MAX_NOTICES + 4}`, '最新一条必须存活')
-  } finally { await rm(dir, { recursive: true, force: true }) }
+  } finally { await rm(dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }) }
 })
 
 test('normalizeNotice: 缺省 id 可推导，畸形字段安全降级', () => {
@@ -118,5 +118,5 @@ test('sidebar-state carries notices until acked; empty omits the field; ack rout
     await store.ack(rest.body.moveNotices.map((n) => n.id))
     const done = await call('/archived-sessions/sidebar-state', {})
     assert.equal('moveNotices' in done.body, false)
-  } finally { await rm(root, { recursive: true, force: true }) }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }) }
 })

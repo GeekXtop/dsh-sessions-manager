@@ -71,7 +71,7 @@ test('store round-trips merge and remove with atomic writes', async () => {
     assert.equal('s1' in finalOnDisk.entries, false)
     assert.equal('s2' in finalOnDisk.entries, true)
   } finally {
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 })
   }
 })
 
@@ -85,6 +85,6 @@ test('store serializes concurrent merges without losing entries', async () => {
     const onDisk = JSON.parse(await readFile(join(dir, 'title-index.json'), 'utf8'))
     assert.equal(Object.keys(onDisk.entries).length, 20)
   } finally {
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 })
   }
 })

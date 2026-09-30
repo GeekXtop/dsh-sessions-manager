@@ -97,7 +97,7 @@ test('request path decodes zero logs; refinement converges in the background and
   assert.deepEqual(opens2, [], 'persisted verdicts must serve the cold instance without a single decode')
   assert.equal(cold.body.lineage['empty-9'].empty, true)
   assert.equal(cold.body.refinePending, false)
-  await rm(root, { recursive: true, force: true })
+  await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 })
 })
 
 test('legacy era never claims refine work (no sizeBytes observation)', async () => {

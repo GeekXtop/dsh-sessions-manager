@@ -46,5 +46,5 @@ test('store: 合并/重启复用/损坏当空/删除', async () => {
     await reopened.remove(['a'])
     await reopened.remove(['a'])
     assert.equal(await reopened.merge({}), false, '空批次不写')
-  } finally { await rm(dir, { recursive: true, force: true }) }
+  } finally { await rm(dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }) }
 })

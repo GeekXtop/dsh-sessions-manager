@@ -231,7 +231,7 @@ test('读到 0 条事件但源日志有内容时拒绝移动（数据安全守�
   )
   assert.equal(existsSync(join(srcDir, 'session.v2.jsonl.zstd')), true, '源日志必须原样保留')
   assert.equal(existsSync(join(root, projectKeyFor(newCwd), encodeSegmentFor(sid))), false, '目标目录不得被创建')
-  await rm(root, { recursive: true, force: true })
+  await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 })
 })
 
 test('临时备份/测试残渣不算真实日志（写所有权探测留下的新代才搬走）', async () => {
@@ -252,5 +252,5 @@ test('临时备份/测试残渣不算真实日志（写所有权探测留下的�
   assert.equal(existsSync(srcDir), false, '源目录整体移除，临时件一并带走')
   const moved = await readFile(join(root, projectKeyFor(newCwd), encodeSegmentFor(sid), 'session.v2.jsonl.zstd'), 'utf8')
   assert.equal(moved, 'moved')
-  await rm(root, { recursive: true, force: true })
+  await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 })
 })

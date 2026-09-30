@@ -99,6 +99,7 @@ const DAY = 86400000
 let tmp
 let routes
 let domainState
+const cleanups = []
 
 before(async () => {
   tmp = await mkdtemp(join(tmpdir(), 'dsm-active-'))
@@ -150,13 +151,20 @@ before(async () => {
     // 关键：0.2.0 的 host 侧这三个访问器一个都不存在（get 恒 null），
     // 只有客户端上报能给出活跃会话。
     get: () => null,
-    effect: (fn) => fn(),
+    // cordis 约定：effect(fn) 立即执行 fn，fn 的返回值是清理函数。这里必须
+    // 收集起来在 after 里执行——否则启动补跑定时器（0/1/3/6/12/30s，写
+    // pending 状态）在 after 的 rm 期间仍会开火，间歇性 ENOTEMPTY（CI 实测）。
+    effect: (fn) => { const r = fn(); if (typeof r === 'function') cleanups.push(r) },
   }
   const { apply } = await import(`../src/index.js?active=${Date.now()}`)
   apply(ctx)
 })
 
-after(async () => { await rm(tmp, { recursive: true, force: true }) })
+after(async () => {
+  for (const c of cleanups.splice(0)) { try { await c() } catch (e) { /* 尽力清理 */ } }
+  // maxRetries 兜底：仍有一个性子慢的异步写入踩进 rm 窗口时重试而非失败。
+  await rm(tmp, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 })
+})
 
 async function call(path, body = {}) {
   const req = Readable.from([Buffer.from(JSON.stringify(body))])

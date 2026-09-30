@@ -150,7 +150,7 @@ before(async () => {
   }
 })
 
-after(async () => { await rm(root, { recursive: true, force: true }) })
+after(async () => { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }) })
 
 test('sidebar-state answers with unknown empties first and refines them in the background (T1)', async () => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms))

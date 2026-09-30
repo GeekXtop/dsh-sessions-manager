@@ -96,7 +96,7 @@ async function boot({ withProjection }) {
     await routes.get(path)(req, res)
     return { status, body: JSON.parse(text) }
   }
-  const cleanup = async () => { await rm(root, { recursive: true, force: true }) }
+  const cleanup = async () => { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }) }
   return { call, warmCalls, cleanup }
 }
 

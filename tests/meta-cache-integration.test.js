@@ -53,7 +53,7 @@ before(async () => {
   apply(buildCtx(routes))
 })
 
-after(async () => { await rm(root, { recursive: true, force: true }) })
+after(async () => { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }) })
 
 async function call(path, body = {}) {
   const req = Readable.from([Buffer.from(JSON.stringify(body))])
