@@ -278,7 +278,20 @@ try {
   // 而本脚本的 ops 直连冒烟全程绿灯——路由层回归与 ops 直连不可互替。
   // 本节在真实 alpha.1 后端上以完整 apply() 启动插件，直接驱动
   // /archived-sessions/move 与 /archived-sessions/trash/purge 路由。
-  {
+  //
+  // P3-B（2026-09-29 审计）：runtime 已有真栈（storage / storage-json /
+  // storage-domain / workspace 包，0.2.0 起 dsh-base 默认组合全带）时，本节的
+  // storageDomain 旧形状 stub 与 mock registry **不再运行**——全部路由级检查
+  // （含 purge 路由与移动字节一致性）已并入下方 DOMAIN-level 真栈段，消除
+  // 「同一路由两套依赖形状」的双真相源。0.1.7 及更早 runtime 仍走本节保底。
+  const resolvePkgDirProbe = (n) => {
+    try { return dirname(requireFrom(pkgs.persistence).resolve(`@deepseek-ai/${n}/package.json`)) } catch (e) { return null }
+  }
+  const hasRealStack = !!(resolvePkgDirProbe('dsh-storage') && resolvePkgDirProbe('dsh-storage-json')
+    && resolvePkgDirProbe('dsh-storage-domain') && resolvePkgDirProbe('dsh-workspace'))
+  if (hasRealStack) {
+    console.log('  · legacy route stubs skipped（真栈可用：路由级检查已并入 DOMAIN-level 真栈段）')
+  } else {
     process.env.DSH_SESSIONS_MANAGER_TRASH_DIR = await mkdtemp(join(tmpdir(), 'dsm-runtime-trash-'))
   // 待移动队列也要落到临时目录，别写进真实的 ~/.dsh/sessions-manager。
   process.env.DSH_SESSIONS_MANAGER_PENDING_DIR = await mkdtemp(join(tmpdir(), 'dsm-runtime-pending-'))
@@ -391,13 +404,16 @@ try {
   }
 
   // ---- DOMAIN-level route smoke: 真实 storageDomain + 真实 workspaceRegistry --
-  // 背景：上面那节把 storageDomain stub 成了旧形状（{ global: { get, set } }），
+  // 背景：ROUTE-level 节把 storageDomain stub 成了旧形状（{ global: { get, set } }），
   // 于是「归档状态落进官方域」这条路径从未被真实后端碰过——而 0.2.0 的
   // storageDomain 是 DomainFacility：get(name) 只返回**已打开**的域，域的 global
   // 由 zod schema 校验（未知键会被 strip，写错字段不会报错但重启后消失）。
   // 本节把 storage 枢纽 + json 后端 + 领域设施 + 官方 WorkspaceRegistry 全真起一遍，
-  // 在真栈上跑归档 / 恢复 / 标签 / 统计 / 移动路由，并回到磁盘介质核验归档状态
-  // 真的持久化了（内存态不算数）。
+  // 在真栈上跑归档 / 恢复 / 标签 / 统计 / 移动 / 回收站路由，并回到磁盘介质核验
+  // 归档状态真的持久化了（内存态不算数）。
+  // P3-B（2026-09-29 审计）起本节还是 0.2.0+ 的**唯一**路由级冒烟：ROUTE-level 的
+  // move 字节一致性、purge 路由与 registry 重定向检查已并入此处；stub 版仅在
+  // 缺真栈的旧 runtime 上运行。
   // runtime 缺包（0.1.7 及更早没有 storage-domain）时整段跳过，不算失败。
   {
     const resolvePkgDir = (n) => {
@@ -415,7 +431,6 @@ try {
       const jsonMod = await loadLib(dirStorageJson)
       const domainMod = await loadLib(dirDomain)
       const wsMod = await loadLib(dirWorkspace)
-      const pluginMod = await import(`../src/index.js?domain=${Date.now()}`)
       const { mkdir: mkdirP, readdir: readdirP, readFile: readFileP } = await import('node:fs/promises')
       const { realpath: realpathP } = await import('node:fs/promises')
 
@@ -425,12 +440,18 @@ try {
       const tmpPending = await mkdtemp(join(tmpdir(), 'dsm-runtime-domain-pending-'))
       const tmpStar = await mkdtemp(join(tmpdir(), 'dsm-runtime-domain-star-'))
       const tmpAuto = await mkdtemp(join(tmpdir(), 'dsm-runtime-domain-aa-'))
+      // ⚠️ env 必须在插件 import 之前设置：src/index.js 的 TRASH_DIR / STATE_DIR
+      // 是**模块级常量**（import 时读 env）。v3.7.4 的 DOMAIN 冒烟把 import 放在
+      // env 之前，插件实例静默落到了真实的 ~/.dsh/sessions-manager(-trash)——
+      // 冒烟的预热条目写进了真实标题索引（2026-09-30 实测污染并清理）。P3-B 的
+      // purge 路由检查暴露了这一点。
       process.env.DSH_SESSIONS_MANAGER_TRASH_DIR = tmpTrash
       process.env.DSH_SESSIONS_MANAGER_PENDING_DIR = tmpPending
       process.env.DSH_SESSIONS_MANAGER_STAR_DIR = tmpStar
       process.env.DSH_SESSIONS_MANAGER_AUTO_ARCHIVE_DIR = tmpAuto
       // 插件自有状态目录必须先存在（star/tag/auto-archive 不会自己建）。
       await mkdirP(tmpTrash, { recursive: true })
+      const pluginMod = await import(`../src/index.js?domain=${Date.now()}`)
 
       // 两个真实工作区目录（会话 cwd 与 workspace path 必须完全一致，官方
       // registry 按 header.cwd 分组）。路径一律 realpath（macOS /var → /private/var）。
@@ -537,12 +558,47 @@ try {
             check('route /storage (real backend): counts the real log bytes',
               stats.status === 200 && stats.body.sessionCount >= 1 && stats.body.totalBytes > 0, stats.body)
 
+            // PURGE 路由（P3-B 自 stub 段并入）：预置真实回收站索引 → 完整路由
+            // → 官方 stat 复核消失 + 墓碑落盘。readTrashStore 每次都读盘（无缓存），
+            // 在 /list 之后预加载也生效。
+            const sidP = `dom-p-${Date.now().toString(36)}`
+            {
+              const writerP = await sp.create({ id: sidP, cwd: wsA, createdAt: Date.now(), version: CURRENT_FORMAT_VERSION, isSeeded: false, delegationDepth: 0 })
+              await writerP.append(mkBatch(0, 1))
+              await writerP.flush()
+              await writerP.close()
+            }
+            const { locateSessionArtifacts } = await import('../src/handle-era-paths.js')
+            const purgeArtifacts = await locateSessionArtifacts(sp, (await sp.stat(sidP)).header)
+            const trashIndex = join(tmpTrash, 'index.json')
+            await (await import('node:fs/promises')).writeFile(trashIndex, JSON.stringify({
+              schemaVersion: 2,
+              settings: { retentionDays: 0 },
+              items: [{ sessionId: sidP, title: 'Domain purge', originalPath: purgeArtifacts.logPath, deletedAt: 1 }],
+              purgedSessionIds: [],
+            }))
+            const purgeRes = await callDom('/archived-sessions/trash/purge', { sessionId: sidP })
+            check('route /trash/purge (real domain): 200 + purged', purgeRes.status === 200 && purgeRes.body.purged === true, purgeRes.body)
+            check('route /trash/purge: official stat no longer sees the session', (await sp.stat(sidP)) === undefined)
+            check('route /trash/purge: tombstone persisted + item removed', (async () => {
+              const { readFileSync } = await import('node:fs')
+              const store = JSON.parse(readFileSync(trashIndex, 'utf8'))
+              return store.purgedSessionIds.includes(sidP) && store.items.length === 0
+            })())
+
             const moved = await callDom('/archived-sessions/move', { sessionId: sidA, targetPath: wsB })
             check('route /move (real registry): session relocates to the target workspace',
               moved.status === 200 && (moved.body.moved === true || moved.body.already === true), moved.body)
             const movedStat = await sp.stat(sidA)
             check('route /move (real registry): official stat carries the new cwd',
               !!movedStat && movedStat.header.cwd === wsB, movedStat && movedStat.header.cwd)
+            // P3-B 自 stub 段并入：移动后事件逐字节保真 + registry 重定向。
+            const { createPersistenceAdapter } = await import('../src/compat/persistence.js')
+            const domAdapter = createPersistenceAdapter(c.sessionPersistence)
+            const movedReread = await domAdapter.readSession(sidA, 0)
+            check('route /move (real registry): events preserved byte-identically', movedReread.events.length === 3, movedReread.events.length)
+            check('route /move (real registry): registry sessionPaths redirected',
+              c.workspaceRegistry.sessionPaths.get(sidA) === wsB, c.workspaceRegistry.sessionPaths.get(sidA))
           } catch (e) {
             smokeError = e
           } finally {

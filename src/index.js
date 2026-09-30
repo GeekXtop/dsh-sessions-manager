@@ -251,6 +251,31 @@ export function apply(ctx) {
     return result
   }
 
+  // —— 0.2.0+ 官方 title 投影快路径（2026-09-29 审计 P2）————————————————
+  // dsh-session-title（0.2.0 起 dsh-base 默认组合挂载）把标题折叠官方化为
+  // O(1) 投影（key='title'，state 为 string|null），注册表对已 materialize 的
+  // cell 提供 cachedSnapshot——只读 watermark 缓存，**零折叠、零磁盘 I/O**
+  // （对比 readTitleSnapshots 每条整本解码，issue #8）。命中即免预热。
+  // 红线：
+  //   1. 只信 cachedSnapshot（绝不调 stateOf——那会对内存日志做同步折叠，
+  //      违反「请求路径零重活」纪律）；
+  //   2. 服务不存在（0.1.7）/会话未实例化/任何异常 → 静默返回 null，行为与
+  //      3.7.4 完全一致；
+  //   3. cachedSnapshot 的 title=null 只说明「该 cell 还没有非空标题」（可能
+  //      会话从未打开、cell 未折叠）——一律当**未知**交回预热队列，绝不冒充
+  //      「会话真的无标题」（empty 三态纪律，v3.7.0 T1）。
+  function projectionTitleOf(liveStore, id) {
+    try {
+      const reg = ctx.get('sessionProjections')
+      if (!reg || typeof reg.cachedSnapshot !== 'function') return null
+      const session = liveStore && liveStore.get && liveStore.get(id)
+      if (!session) return null
+      const snap = reg.cachedSnapshot(session, ['title'])
+      const title = snap && snap.values ? snap.values.title : null
+      return typeof title === 'string' && title.length > 0 ? title : null
+    } catch (e) { return null }
+  }
+
   async function archivedState() {
     const d = dom()
     if (!d) throw new Error('workspace domain is not open')
@@ -1478,7 +1503,26 @@ export function apply(ctx) {
         createdAt: (header && header.createdAt != null) ? header.createdAt : meta.createdAt,
       })
     }
-    const stillMissing = missing.filter((id) => !persisted.has(id))
+    const stillMissing0 = missing.filter((id) => !persisted.has(id))
+    // 0.2.0+ 官方投影快路径：先把「已实例化且 cell 已 materialize」的会话从
+    // 预热队列里捞回来（cachedSnapshot 零 I/O），剩下的才进后台预热。
+    // 注意：metaCache.set 在指纹不可算（无 stat / revision 缺失）时**拒绝写入**，
+    // 所以命中结果另存 projectionMeta，本请求的渲染链直接可用——缓存只是增益。
+    const projectionMeta = new Map()
+    const stillMissing = []
+    for (const id of stillMissing0) {
+      const title = projectionTitleOf(live, id)
+      if (title == null) { stillMissing.push(id); continue }
+      const entry = entryById.get(id)
+      const header = entry && entry.header ? entry.header : null
+      const meta = {
+        title,
+        cwd: (header && typeof header.cwd === 'string' && header.cwd) ? header.cwd : null,
+        createdAt: (header && header.createdAt != null) ? header.createdAt : null,
+      }
+      projectionMeta.set(id, meta)
+      metaCache.set(id, statsById.get(id), meta)
+    }
     // issue #8：缺失部分交后台预热（分批 + 让步），请求路径零投影、零日志解码。
     if (stillMissing.length) enqueueWarm(stillMissing, statsById, entryById)
     const items = []
@@ -1487,7 +1531,7 @@ export function apply(ctx) {
       // metaCache（persisted.get 里的 cwd 可能因移动会话而陈旧）。
       // 完全未命中的会话也不能丢 cwd/createdAt——它们来自 list header，零成本
       // 且是工作区归属/创建时间的权威来源；只有标题允许占位等后台预热（issue #8）。
-      let meta = metaCache.get(id, statsById.get(id)) || persisted.get(id) || null
+      let meta = metaCache.get(id, statsById.get(id)) || persisted.get(id) || projectionMeta.get(id) || null
       if (!meta) {
         meta = { title: null, cwd: null, createdAt: null }
         const entry = entryById.get(id)
